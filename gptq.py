@@ -1,6 +1,7 @@
 import math
 import time
 
+import numpy as np
 import torch
 import torch.nn as nn
 import transformers
@@ -9,11 +10,81 @@ from quant import *
 
 
 DEBUG = False 
+DEBUG = False
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
+def dct(src, dim=-1, norm='ortho'):
+    # type: (torch.tensor, int, str) -> torch.tensor
 
+    x = src.clone()
+    N = x.shape[dim]
 
+    x = x.transpose(dim, -1)
+    x_shape = x.shape
+    x = x.contiguous().view(-1, N)
+
+    v = torch.empty_like(x, device=x.device)
+    v[..., :(N - 1) // 2 + 1] = x[..., ::2]
+
+    if N % 2:  # odd length
+        v[..., (N - 1) // 2 + 1:] = x.flip(-1)[..., 1::2]
+    else:  # even length
+        v[..., (N - 1) // 2 + 1:] = x.flip(-1)[..., ::2]
+
+    V = torch.fft.fft(v, dim=-1)
+
+    k = torch.arange(N, device=x.device)
+    V = 2 * V * torch.exp(-1j * np.pi * k / (2 * N))
+
+    if norm == 'ortho':
+        V[..., 0] *= math.sqrt(1/(4*N))
+        V[..., 1:] *= math.sqrt(1/(2*N))
+
+    V = V.real
+    V = V.view(*x_shape).transpose(-1, dim)
+
+    return V
+
+def idct(src, dim=-1, norm='ortho'):
+    # type: (torch.tensor, int, str) -> torch.tensor
+
+    X = src.clone()
+    N = X.shape[dim]
+
+    X = X.transpose(dim, -1)
+    X_shape = X.shape
+    X = X.contiguous().view(-1, N)
+
+    if norm == 'ortho':
+        X[..., 0] *= 1 / math.sqrt(2)
+        X *= N*math.sqrt((2 / N))
+    else:
+        raise Exception("idct with norm=None is buggy A.F")
+
+    k = torch.arange(N, device=X.device)
+
+    X = X * torch.exp(1j * np.pi * k / (2 * N))
+    X = torch.fft.ifft(X, dim=-1).real
+    v = torch.empty_like(X, device=X.device)
+
+    v[..., ::2] = X[..., :(N - 1) // 2 + 1]
+    v[..., 1::2] = X[..., (N - 1) // 2 + 1:].flip(-1)
+
+    v = v.view(*X_shape).transpose(-1, dim)
+    return v
+
+def dct_2d(x, norm='ortho'):
+
+    X1 = dct(x, norm=norm)
+    X2 = dct(X1.transpose(-1, -2), norm=norm)
+    return X2.transpose(-1, -2)
+
+def idct_2d(X, norm='ortho'):
+
+    x1 = idct(X, norm=norm)
+    x2 = idct(x1.transpose(-1, -2), norm=norm)
+    return x2.transpose(-1, -2)
 class GPTQ:
 
     def __init__(self, layer):
@@ -28,7 +99,6 @@ class GPTQ:
         self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
-
     def add_batch(self, inp, out):
         if DEBUG:
             self.inp1 = inp
@@ -59,6 +129,8 @@ class GPTQ:
 
     def fasterquant(
         self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False
+        self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False,
+        dct_mode = 0
     ):
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
@@ -67,17 +139,17 @@ class GPTQ:
             W = W.t()
         W = W.float()
 
+        if dct_mode == 2:
+            W=dct_2d(W)
         tick = time.time()
 
         if not self.quantizer.ready():
             self.quantizer.find_params(W, weight=True)
-
         H = self.H
         del self.H
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
-
         if static_groups:
             import copy
             groups = []
@@ -85,13 +157,14 @@ class GPTQ:
                 quantizer = copy.deepcopy(self.quantizer)
                 quantizer.find_params(W[:, i:(i + groupsize)], weight=True)
                 groups.append(quantizer)
-
         if actorder:
             perm = torch.argsort(torch.diag(H), descending=True)
             W = W[:, perm]
             H = H[perm][:, perm]
             invperm = torch.argsort(perm)
 
+        if dct_mode == 2:
+            W=dct_2d(W)
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
 
@@ -102,21 +175,17 @@ class GPTQ:
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
-
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
-
             W1 = W[:, i1:i2].clone()
             Q1 = torch.zeros_like(W1)
             Err1 = torch.zeros_like(W1)
             Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
-
             for i in range(count):
                 w = W1[:, i]
                 d = Hinv1[i, i]
-
                 if groupsize != -1:
                     if not static_groups:
                         if (i1 + i) % groupsize == 0:
@@ -126,46 +195,38 @@ class GPTQ:
                         if actorder:
                             idx = perm[idx]
                         self.quantizer = groups[idx // groupsize]
-
                 q = quantize(
                     w.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
                 ).flatten()
                 Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d ** 2
-
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
-
             Q[:, i1:i2] = Q1
             Losses[:, i1:i2] = Losses1 / 2
-
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-
             if DEBUG:
                 self.layer.weight.data[:, :i2] = Q[:, :i2]
                 self.layer.weight.data[:, i2:] = W[:, i2:]
                 print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
                 print(torch.sum(Losses))
 
+        if dct_mode == 2:
+            Q = idct_2d(W)
         torch.cuda.synchronize()
         print('time %.2f' % (time.time() - tick))
         print('error', torch.sum(Losses).item())
-
         if actorder:
             Q = Q[:, invperm]
 
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        if dct_mode == 2:
+            Q = idct_2d(W)
+            self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        else
+            self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         if DEBUG:
             print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
-
-    def free(self):
-        if DEBUG:
-            self.inp1 = None
-            self.out1 = None
-        self.H = None
-        self.Losses = None
-        self.Trace = None
-        torch.cuda.empty_cache()
