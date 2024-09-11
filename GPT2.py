@@ -10,7 +10,7 @@ from scipy import stats
 import numpy as np
 
 
-def get_opt(model):
+def get_gpt2(model):
     import torch
     def skip(*args, **kwargs):
         pass
@@ -112,7 +112,7 @@ def gpt2_eval(model, testenc, dev):
     model.config.use_cache = use_cache
 
 
-def opt_multigpu(model, gpus):
+def gpt_multigpu(model, gpus):
     model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(gpus[0])
     model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(gpus[0])
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
@@ -233,7 +233,7 @@ if __name__ == '__main__':
     if args.load:
         model = load_quant3(args.model, args.load)
     else:
-        model = get_opt(args.model)
+        model = get_gpt2(args.model)
         model.eval()
 
     dataloader, testloader = get_loaders(
@@ -246,7 +246,7 @@ if __name__ == '__main__':
      for dataset in datasets:
          dataloader, testloader = get_loaders(dataset, seed=args.seed, model=args.model, seqlen=model.seqlen)
          print(dataset)
-         GPT2_eval(model, testloader, DEV)
+         gpt2_eval(model, testloader, DEV)
 
     
 
