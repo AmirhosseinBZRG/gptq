@@ -15,7 +15,7 @@ from utils import find_layers, DEV, set_seed, get_wikitext2,  get_loaders, expor
 from texttable import Texttable
 
 
-def get_llama(model):
+def get_GPT2(model):
     huggingface_hub.login("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")
     access_token = "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"
     def skip(*args, **kwargs):
@@ -30,154 +30,9 @@ def get_llama(model):
     return model
 
 
-@torch.no_grad()
-def llama_sequential(model, dataloader, dev):
-    print('Starting ...')
-
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
-
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    model.model.norm = model.model.norm.to(dev)
-    layers[0] = layers[0].to(dev)
-
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev)
-    cache = {'i': 0, 'attention_mask': None}
-
-    class Catcher(nn.Module):
-
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            raise ValueError
-
-    layers[0] = Catcher(layers[0])
-    for batch in dataloader:
-        try:
-            model(batch[0].to(dev))
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-
-    layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
-    model.model.norm = model.model.norm.cpu()
-    torch.cuda.empty_cache()
-
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
-
-    print('Ready.')
-
-    quantizers = {}
-    observer = Observer()
-    for i in range(len(layers)):
-
-        print(f'Quantizing layer {i+1}/{len(layers)}..')
-        print('+------------------+--------------+------------+-----------+-------+')
-        print('|       name       | weight_error | fp_inp_SNR | q_inp_SNR | time  |')
-        print('+==================+==============+============+===========+=======+')
-
-        layer = layers[i].to(dev)
-        full = find_layers(layer)
-        if args.true_sequential:
-            sequential = [['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'], ['self_attn.o_proj'], ['mlp.up_proj', 'mlp.gate_proj'], ['mlp.down_proj']]
-        else:
-            sequential = [list(full.keys())]
-
-        for names in sequential:
-            subset = {n: full[n] for n in names}
-            gptq = {}
-            for name in subset:
-                gptq[name] = GPTQ(subset[name], observe=args.observe)
-                gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False)
-
-            def add_batch(name):
-
-                def tmp(_, inp, out):
-                    gptq[name].add_batch(inp[0].data, out.data)
-
-                return tmp
-
-            handles = []
-            for name in subset:
-                handles.append(subset[name].register_forward_hook(add_batch(name)))
-            for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-            for h in handles:
-                h.remove()
-
-            for name in subset:
-                scale, zero, g_idx, error = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, name=name)
-                quantizers['model.layers.%d.%s' % (i, name)] = (gptq[name].quantizer.cpu(), scale.cpu(), zero.cpu(), g_idx.cpu(), args.wbits, args.groupsize)
-
-                if args.observe:
-                    observer.submit(name=name, layerid=i, gptq=gptq[name], error=error)
-                else:
-                    gptq[name].free()
-
-        for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-
-        layers[i] = layer.cpu()
-        del layer
-        del gptq
-        torch.cuda.empty_cache()
-
-        inps, outs = outs, inps
-        print('+------------------+--------------+------------+-----------+-------+')
-        print('\n')
-
-    if args.observe:
-        observer.print()
-        conditions = gen_conditions(args.wbits, args.groupsize)
-        for item in observer.items():
-            name = item[0]
-            layerid = item[1]
-            gptq = item[2]['gptq']
-            error = item[2]['error']
-            target = error / 2
-
-            table = Texttable()
-            table.header(['wbits', 'groupsize', 'error'])
-            table.set_cols_dtype(['i', 'i', 'f'])
-            table.add_row([args.wbits, args.groupsize, error])
-
-            print('Optimizing {} {} ..'.format(name, layerid))
-            for wbits, groupsize in conditions:
-
-                if error < target:
-                    # if error dropped 50%, skip
-                    break
-
-                gptq.quantizer.configure(wbits, perchannel=True, sym=args.sym, mse=False)
-
-                scale, zero, g_idx, error = gptq.fasterquant(percdamp=args.percdamp, groupsize=groupsize, actorder=args.act_order, name=name)
-
-                table.add_row([wbits, groupsize, error])
-                quantizers['model.layers.%d.%s' % (layerid, name)] = (gptq.quantizer.cpu(), scale.cpu(), zero.cpu(), g_idx.cpu(), wbits, groupsize)
-
-            print(table.draw())
-            print('\n')
-            gptq.layer.to('cpu')
-            gptq.free()
-
-    model.config.use_cache = use_cache
-
-    return quantizers
-
 
 @torch.no_grad()
-def llama_eval(model, testenc, dev):
+def GPT2_eval(model, testenc, dev):
     print('Evaluating ...')
     model = model.to(dev)
     testenc = testenc.input_ids.to(dev)
@@ -287,71 +142,8 @@ def llama_eval(model, testenc, dev):
     model.config.use_cache = use_cache
 
 
-# TODO: perform packing on GPU
-def llama_pack(model, quantizers, wbits, groupsize):
-    layers = find_layers(model)
-    layers = {n: layers[n] for n in quantizers}
-    quant.make_quant_linear(model, quantizers, wbits, groupsize)
-    qlayers = find_layers(model, [quant.QuantLinear])
-    print('Packing ...')
-    for name in qlayers:
-        print(name)
-        quantizers[name], scale, zero, g_idx, _, _ = quantizers[name]
-        qlayers[name].pack(layers[name], scale, zero, g_idx)
-    print('Done.')
-    return model
 
-
-def load_quant(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, eval=True, warmup_autotune=True):
-    from transformers import LlamaConfig, LlamaForCausalLM, modeling_utils
-    config = LlamaConfig.from_pretrained(model)
-
-    def noop(*args, **kwargs):
-        pass
-
-    torch.nn.init.kaiming_uniform_ = noop
-    torch.nn.init.uniform_ = noop
-    torch.nn.init.normal_ = noop
-
-    torch.set_default_dtype(torch.half)
-    modeling_utils._init_weights = False
-    torch.set_default_dtype(torch.half)
-    model = LlamaForCausalLM(config)
-    torch.set_default_dtype(torch.float)
-    if eval:
-        model = model.eval()
-    layers = find_layers(model)
-    for name in ['lm_head']:
-        if name in layers:
-            del layers[name]
-    quant.make_quant_linear(model, layers, wbits, groupsize)
-
-    del layers
-
-    print('Loading model ...')
-    if checkpoint.endswith('.safetensors'):
-        from safetensors.torch import load_file as safe_load
-        model.load_state_dict(safe_load(checkpoint))
-    else:
-        model.load_state_dict(torch.load(checkpoint))
-
-    if eval:
-        quant.make_quant_attn(model)
-        quant.make_quant_norm(model)
-        if fused_mlp:
-            quant.make_fused_mlp(model)
-
-    if warmup_autotune:
-        quant.autotune_warmup_linear(model, transpose=not (eval))
-        if eval and fused_mlp:
-            quant.autotune_warmup_fused(model)
-    model.seqlen = 2048
-    print('Done.')
-
-    return model
-
-
-def llama_multigpu(model, gpus, gpu_dist):
+def GPT2_multigpu(model, gpus, gpu_dist):
     model.model.embed_tokens = model.model.embed_tokens.to(gpus[0])
     if hasattr(model.model, 'norm') and model.model.norm:
         model.model.norm = model.model.norm.to(gpus[0])
@@ -408,61 +200,6 @@ def llama_multigpu(model, gpus, gpu_dist):
     model.gpus = gpus
 
 
-def benchmark(model, input_ids, check=False):
-    input_ids = input_ids.to(model.gpus[0] if hasattr(model, 'gpus') else DEV)
-    torch.cuda.synchronize()
-
-    cache = {'past': None}
-
-    def clear_past(i):
-
-        def tmp(layer, inp, out):
-            if cache['past']:
-                cache['past'][i] = None
-
-        return tmp
-
-    for i, layer in enumerate(model.model.layers):
-        layer.register_forward_hook(clear_past(i))
-
-    print('Benchmarking ...')
-
-    if check:
-        loss = nn.CrossEntropyLoss()
-        tot = 0.
-
-    def sync():
-        if hasattr(model, 'gpus'):
-            for gpu in model.gpus:
-                torch.cuda.synchronize(gpu)
-        else:
-            torch.cuda.synchronize()
-
-    max_memory = 0
-    with torch.no_grad():
-        attention_mask = torch.ones((1, input_ids.numel()), device=DEV)
-        times = []
-        for i in range(input_ids.numel()):
-            tick = time.time()
-            out = model(input_ids[:, i:i + 1], past_key_values=cache['past'], attention_mask=attention_mask[:, :(i + 1)].reshape((1, -1)))
-            sync()
-            times.append(time.time() - tick)
-            print(i, times[-1])
-            if hasattr(model, 'gpus'):
-                mem_allocated = sum(torch.cuda.memory_allocated(gpu) for gpu in model.gpus) / 1024 / 1024
-            else:
-                mem_allocated = torch.cuda.memory_allocated() / 1024 / 1024
-            max_memory = max(max_memory, mem_allocated)
-            if check and i != input_ids.numel() - 1:
-                tot += loss(out.logits[0].to(DEV), input_ids[:, (i + 1)].to(DEV)).float()
-            cache['past'] = list(out.past_key_values)
-            del out
-        sync()
-        print('Median:', np.median(times))
-        if check:
-            print('PPL:', torch.exp(tot / (input_ids.numel() - 1)).item())
-            print('max memory(MiB):', max_memory)
-
 
 if __name__ == '__main__':
 
@@ -496,72 +233,42 @@ if __name__ == '__main__':
     parser.add_argument('--quant-directory', type=str, default=None, help='Specify the directory for export quantization parameters to toml format. `None` means no export by default.')
 
     args = parser.parse_args()
-
-    if args.layers_dist:
-        gpu_dist = [int(x) for x in args.layers_dist.split(':')]
-    else:
-        gpu_dist = []
-
-    if type(args.load) is not str:
-        args.load = args.load.as_posix()
-
     if args.load:
-        model = load_quant(args.model, args.load, args.wbits, args.groupsize)
+        model = load_quant3(args.model, args.load)
     else:
-        model = get_llama(args.model)
+        model = get_opt(args.model)
         model.eval()
 
-    dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen)
+    dataloader, testloader = get_loaders(
+        args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
+    )
 
-    if not args.load and args.wbits < 16 and not args.nearest:
+    if args.wbits < 16 and not args.nearest:
         tick = time.time()
-        quantizers = llama_sequential(model, dataloader, DEV)
+        quantizers = opt_sequential(model, dataloader, DEV)
         print(time.time() - tick)
 
-    #if args.benchmark:
-        #gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
-        #if len(gpus) > 1:
-            #llama_multigpu(model, gpus, gpu_dist)
-        #else:
-            #model = model.to(DEV)
-        #if args.benchmark:
-            
-          #input_ids = next(iter(dataloader))[0][:, :args.benchmark]
-          #benchmark(model, input_ids, check=args.check)
-
-    if args.eval:
-        datasets = ['wikitext2', 'hellaswag']
-        for dataset in datasets:
-            dataloader, testloader = get_loaders(dataset, seed=args.seed, model=args.model, seqlen=model.seqlen)
-            print(dataset)
-            llama_eval(model, testloader, DEV)
-    
-    if args.test_generation:
+    if args.benchmark:
         gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
         if len(gpus) > 1:
-            llama_multigpu(model, gpus, gpu_dist)
+            opt_multigpu(model, gpus)
         else:
             model = model.to(DEV)
-
-        from transformers import LlamaTokenizer, TextStreamer
-        tokenizer = LlamaTokenizer.from_pretrained(args.model, use_fast=False)
-        input_ids = tokenizer(["The capital of New Mexico is"], return_tensors="pt").input_ids.to(gpus[0])
-        streamer = TextStreamer(tokenizer)
-        with torch.no_grad():
-            generated_ids = model.generate(input_ids, streamer=streamer)
-        
+        if args.benchmark:
+            input_ids = next(iter(dataloader))[0][:, :args.benchmark]
+            benchmark(model, input_ids, check=args.check)
+    if args.load:
+        exit()
 
 
-    if args.quant_directory is not None:
-        export_quant_table(quantizers, args.quant_directory)
 
-    if not args.observe and args.save:
-        llama_pack(model, quantizers, args.wbits, args.groupsize)
-        torch.save(model.state_dict(), args.save)
+    if args.eval:
+     datasets = ['wikitext2', 'hellaswag']
+     for dataset in datasets:
+         dataloader, testloader = get_loaders(dataset, seed=args.seed, model=args.model, seqlen=model.seqlen)
+         print(dataset)
+         GPT2_eval(model, testloader, DEV)
 
-    if not args.observe and args.save_safetensors:
-        llama_pack(model, quantizers, args.wbits, args.groupsize)
-        from safetensors.torch import save_file as safe_save
-        state_dict = model.state_dict()
-        state_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
-        safe_save(state_dict, args.save_safetensors)
+    
+
+
