@@ -161,7 +161,7 @@ def gpt_multigpu(model, gpus):
 
 if __name__ == '__main__':
     import argparse
-    from datautils_for_gpt2.py import *
+    from datagpt2 import *
 
     parser = argparse.ArgumentParser()
 
@@ -222,7 +222,7 @@ if __name__ == '__main__':
         help='Whether to compute perplexity during benchmarking for verification.'
     )
     parser.add_argument(
-        '--new-eval', action='store_true',
+        '--eval', action='store_true',
         help='Whether to use the new PTB and C4 eval.'
     )
     parser.add_argument(
