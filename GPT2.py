@@ -10,16 +10,26 @@ from scipy import stats
 import numpy as np
 
 
-def get_gpt2(model):
+def get_gpt2(model_name):
     import torch
+    
+    # Skip initialization functions
     def skip(*args, **kwargs):
         pass
+    
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    from transformers import OPTForCausalLM
-    model = OPTForCausalLM.from_pretrained(model, torch_dtype='auto')
-    model.seqlen = model.config.max_position_embeddings
+    
+    # Import the GPT-2 model class
+    from transformers import GPT2LMHeadModel
+    
+    # Load the GPT-2 model
+    model = GPT2LMHeadModel.from_pretrained(model_name, torch_dtype='auto')
+    
+    # Set the sequence length based on the model's configuration
+    model.seqlen = model.config.n_positions  # Use n_positions for GPT-2
+    
     return model
 
 
