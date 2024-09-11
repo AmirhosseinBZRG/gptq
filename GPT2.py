@@ -151,7 +151,7 @@ def gpt_multigpu(model, gpus):
 
 if __name__ == '__main__':
     import argparse
-    from datautils import *
+    from datautils_for_gpt2.py import *
 
     parser = argparse.ArgumentParser()
 
