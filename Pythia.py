@@ -1,8 +1,20 @@
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import PythiaForCausalLM, PythiaTokenizerFast
 from datasets import load_dataset
+from transformers import AutoTokenizer, GPTNeoXForCausalLM
+from torch.utils.data import Dataset, DataLoader
+from datasets import ReadInstruction
+from datasets import load_dataset as load_dataset
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from datetime import datetime
+import pandas as pd
+import numpy as np
+import multiprocessing
+import torch
+import os
+import time
 
 def batched_perplexity(model, dataset, tokenizer, batch_size, stride):
     device = model.device
@@ -47,9 +59,9 @@ def batched_perplexity(model, dataset, tokenizer, batch_size, stride):
 
 if __name__ == "__main__":
     device = "cuda"
-    model_id = "your-pythia-model-id"  # Replace with your Pythia model ID
-    model = PythiaForCausalLM.from_pretrained(model_id).to(device)
-    tokenizer = PythiaTokenizerFast.from_pretrained(model_id)
+    model_id = "EleutherAI/pythia-410m"  # Replace with your Pythia model ID
+    model = GPTNeoXForCausalLM.from_pretrained(model_id).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
     max_len = model.config.n_positions
     stride = 512
     batch_size = 16
