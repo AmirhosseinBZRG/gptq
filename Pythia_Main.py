@@ -51,7 +51,7 @@ def batched_perplexity(model, dataset, tokenizer, batch_size, stride):
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_id = "EleutherAI/pythia-1.4b"  # Replace with your Pythia model ID
+    model_id = "EleutherAI/pythia-1b"  # Replace with your Pythia model ID
     model = GPTNeoXForCausalLM.from_pretrained(model_id).to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     max_len = model.config.max_position_embeddings
