@@ -22,10 +22,10 @@ def get_pythia(model_name):
     torch.nn.init.normal_ = skip
     
     # Import the Pythia model class
-    from transformers import PythiaForCausalLM
+    from transformers import AutoModelForCausalLM 
     
     # Load the Pythia model
-    model = PythiaForCausalLM.from_pretrained(model_name, torch_dtype='auto')
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype='auto')
     
     # Set the sequence length based on the model's configuration
     model.seqlen = model.config.max_position_embeddings  # Use max_position_embeddings for Pythia
@@ -34,10 +34,7 @@ def get_pythia(model_name):
 
 
 
-import torch
-import torch.nn as nn
-import numpy as np
-from scipy import stats
+
 
 @torch.no_grad()
 def pythia_eval(model, testenc, dev, confidence_level=0.95):
@@ -275,7 +272,7 @@ if __name__ == '__main__':
     if args.load:
         model = load_quant3(args.model, args.load)
     else:
-        model = get_gpt2(args.model)
+        model = get_pythia(args.model)
         model.eval()
 
     dataloader, testloader = get_loaders(
